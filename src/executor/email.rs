@@ -47,7 +47,7 @@ impl JobHandler for EmailHandler {
             .to(to_mailbox)
             .subject("RustQueue Notification")
             .body(format!(
-                "Thsi email was processed by RustQueue. Job payload: {}",
+                "This email was processed by RustQueue. Job payload: {}",
                 payload
             ))
             .context("failed to build email")?;
