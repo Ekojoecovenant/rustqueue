@@ -24,11 +24,25 @@ pub async fn run_worker(pool: PgPool, config: Config, tx: broadcast::Sender<Stri
     }
 }
 
+pub async fn run_stale_job_reaper(pool: &PgPool) {
+    loop {
+        match reclaim_stale_jobs(&pool).await {
+            Ok(count) if count > 0 => {
+                println!("Reclaimed {} stale job(s)", count);
+            }
+            Ok(_) => {}
+            Err(e) => eprintln!("Error reclaiming statle jobs: {:?}", e),
+        }
+
+        sleep(Duration::from_secs(60)).await;
+    }
+}
+
 async fn claim_next_job(pool: &PgPool) -> anyhow::Result<Option<Job>> {
     let result = sqlx::query_as::<_, Job>(
         r#"
       UPDATE jobs
-      SET status = 'processing', updated_at = now()
+      SET status = 'processing', updated_at = now(), processing_started_at = now()
       WHERE id = (
         SELECT id FROM jobs
         WHERE status = 'pending' AND scheduled_at <= now()
@@ -49,20 +63,21 @@ async fn process_job(pool: &PgPool, config: &Config, tx: &broadcast::Sender<Stri
     let handler = match executor::get_handler(&job.job_type, config) {
         Ok(h) => h,
         Err(e) => {
-            mark_failed(pool, tx, job.id, &e.to_string()).await;
+            let current_attempt = job.attempts + 1;
+            mark_failed(pool, tx, job.id, current_attempt, &e.to_string()).await;
             return;
         }
     };
 
-    match handler.execute(&job.payload).await {
-        Ok(()) => mark_done(pool, tx, job.id).await,
-        Err(e) => {
-            let next_attempt = job.attempts + 1;
+    let current_attempt = job.attempts + 1;
 
-            if next_attempt < job.max_attempts {
-                schedule_retry(pool, tx, job.id, next_attempt, &e.to_string()).await;
+    match handler.execute(&job.payload).await {
+        Ok(()) => mark_done(pool, tx, job.id, current_attempt).await,
+        Err(e) => {
+            if current_attempt < job.max_attempts {
+                schedule_retry(pool, tx, job.id, current_attempt, &e.to_string()).await;
             } else {
-                mark_failed(pool, tx, job.id, &e.to_string()).await;
+                mark_failed(pool, tx, job.id, current_attempt, &e.to_string()).await;
             }
         }
     }
@@ -75,7 +90,6 @@ async fn schedule_retry(
     next_attempt: i32,
     error: &str,
 ) {
-    // exponential backoff: 1s, 5s, 25s... (5^attempt seconds, roughly matching your Dilamme pattern)
     let backoff_secs = 5i64.pow(next_attempt as u32 - 1).min(300); // cap at 5 minutes
 
     let result = sqlx::query(
@@ -85,6 +99,7 @@ async fn schedule_retry(
             attempts = $1,
             last_error = $2,
             scheduled_at = now() + ($3 || ' seconds')::interval,
+            processing_started_at = NULL,
             updated_at = now()
         WHERE id = $4
         "#,
@@ -104,21 +119,31 @@ async fn schedule_retry(
     }
 }
 
-async fn mark_done(pool: &PgPool, tx: &broadcast::Sender<String>, job_id: Uuid) {
-    let result = sqlx::query("UPDATE jobs SET status = 'done', updated_at = now() WHERE id = $1")
-        .bind(job_id)
-        .execute(pool)
-        .await;
+async fn mark_done(pool: &PgPool, tx: &broadcast::Sender<String>, job_id: Uuid, attempt: i32) {
+    let result = sqlx::query(
+        "UPDATE jobs SET status = 'done', attempts = $1, processing_started_at = NULL, updated_at = now() WHERE id = $2",
+    )
+    .bind(attempt)
+    .bind(job_id)
+    .execute(pool)
+    .await;
 
     if result.is_ok() {
         let _ = tx.send(format!("Job {} - done", job_id));
     }
 }
 
-async fn mark_failed(pool: &PgPool, tx: &broadcast::Sender<String>, job_id: Uuid, error: &str) {
+async fn mark_failed(
+    pool: &PgPool,
+    tx: &broadcast::Sender<String>,
+    job_id: Uuid,
+    attempt: i32,
+    error: &str,
+) {
     let result = sqlx::query(
-        "UPDATE jobs SET status = 'failed', last_error = $1, updated_at = now() WHERE id = $2",
+        "UPDATE jobs SET status = 'failed', attempts = $1, last_error = $2, processing_started_at = NULL, updated_at = now() WHERE id = $3",
     )
+    .bind(attempt)
     .bind(error)
     .bind(job_id)
     .execute(pool)
@@ -127,4 +152,19 @@ async fn mark_failed(pool: &PgPool, tx: &broadcast::Sender<String>, job_id: Uuid
     if result.is_ok() {
         let _ = tx.send(format!("Job {} - failed: {}", job_id, error));
     }
+}
+
+async fn reclaim_stale_jobs(pool: &PgPool) -> anyhow::Result<u64> {
+    let result = sqlx::query(
+        r#"
+      UPDATE jobs
+      SET status = 'pending', updated_at = now(), processing_started_at = NULL
+      WHERE status = 'processing'
+        AND processing_started_at < now() - interval '5 minutes'
+    "#,
+    )
+    .execute(pool)
+    .await?;
+
+    Ok(result.rows_affected())
 }

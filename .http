@@ -10,7 +10,7 @@ Content-Type: application/json
 {
   "job_type": "email",
   "payload": {
-    "to": "test@gmail.com"
+    "to": "covenantekojoe@gmail.com"
   }
 }
 

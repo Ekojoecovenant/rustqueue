@@ -12,6 +12,7 @@ pub struct Job {
     pub max_attempts: i32,
     pub last_error: Option<String>,
     pub scheduled_at: DateTime<Utc>,
+    pub processing_started_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
