@@ -55,12 +55,52 @@ async fn process_job(pool: &PgPool, config: &Config, tx: &broadcast::Sender<Stri
     };
 
     match handler.execute(&job.payload).await {
-        Ok(()) => {
-            mark_done(pool, tx, job.id).await;
-        }
+        Ok(()) => mark_done(pool, tx, job.id).await,
         Err(e) => {
-            mark_failed(pool, tx, job.id, &e.to_string()).await;
+            let next_attempt = job.attempts + 1;
+
+            if next_attempt < job.max_attempts {
+                schedule_retry(pool, tx, job.id, next_attempt, &e.to_string()).await;
+            } else {
+                mark_failed(pool, tx, job.id, &e.to_string()).await;
+            }
         }
+    }
+}
+
+async fn schedule_retry(
+    pool: &PgPool,
+    tx: &broadcast::Sender<String>,
+    job_id: Uuid,
+    next_attempt: i32,
+    error: &str,
+) {
+    // exponential backoff: 1s, 5s, 25s... (5^attempt seconds, roughly matching your Dilamme pattern)
+    let backoff_secs = 5i64.pow(next_attempt as u32 - 1).min(300); // cap at 5 minutes
+
+    let result = sqlx::query(
+        r#"
+        UPDATE jobs
+        SET status = 'pending',
+            attempts = $1,
+            last_error = $2,
+            scheduled_at = now() + ($3 || ' seconds')::interval,
+            updated_at = now()
+        WHERE id = $4
+        "#,
+    )
+    .bind(next_attempt)
+    .bind(error)
+    .bind(backoff_secs.to_string())
+    .bind(job_id)
+    .execute(pool)
+    .await;
+
+    if result.is_ok() {
+        let _ = tx.send(format!(
+            "Job {} - retry {} scheduled in {}s",
+            job_id, next_attempt, backoff_secs
+        ));
     }
 }
 
