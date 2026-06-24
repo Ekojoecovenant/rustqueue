@@ -1,18 +1,36 @@
+use std::sync::Arc;
 use std::time::Duration;
 
 use sqlx::PgPool;
-use tokio::{sync::broadcast, time::sleep};
+use tokio::{
+    sync::{Semaphore, broadcast},
+    time::sleep,
+};
 use uuid::Uuid;
 
 use crate::{config::Config, executor, models::job::Job};
 
+const MAX_CONCURRENT_JOBS: usize = 10;
+
 pub async fn run_worker(pool: PgPool, config: Config, tx: broadcast::Sender<String>) {
+    let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_JOBS));
+
     loop {
         match claim_next_job(&pool).await {
             Ok(Some(job)) => {
                 println!("Claimed job: {} ({})", job.id, job.job_type);
                 let _ = tx.send(format!("Job {} - processing", job.id));
-                process_job(&pool, &config, &tx, job).await;
+
+                // Wait for an available slot, then process this job concurrently
+                let permit = semaphore.clone().acquire_owned().await.unwrap();
+                let pool = pool.clone();
+                let config = config.clone();
+                let tx = tx.clone();
+
+                tokio::spawn(async move {
+                    process_job(&pool, &config, &tx, job).await;
+                    drop(permit);
+                });
             }
             Ok(None) => {}
             Err(e) => {
