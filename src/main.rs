@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use anyhow::Result;
 
 mod config;
@@ -13,15 +15,16 @@ async fn main() -> Result<()> {
 
     let config = config::Config::from_env()?;
     let pool = db::create_pool(&config.database_url).await?;
+    let registry = Arc::new(executor::HandlerRegistry::new(&config)?);
 
     let (tx, _rx) = tokio::sync::broadcast::channel(100);
 
     // Worker loop
     let worker_pool = pool.clone();
-    let worker_config = config.clone();
+    let worker_registry = registry.clone();
     let worker_tx = tx.clone();
     tokio::spawn(async move {
-        worker::run_worker(worker_pool, worker_config, worker_tx).await;
+        worker::run_worker(worker_pool, worker_registry, worker_tx).await;
     });
 
     // Stale-job reaper

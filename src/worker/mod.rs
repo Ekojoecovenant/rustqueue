@@ -8,11 +8,15 @@ use tokio::{
 };
 use uuid::Uuid;
 
-use crate::{config::Config, executor, models::job::Job};
+use crate::{executor::HandlerRegistry, models::job::Job};
 
 const MAX_CONCURRENT_JOBS: usize = 10;
 
-pub async fn run_worker(pool: PgPool, config: Config, tx: broadcast::Sender<String>) {
+pub async fn run_worker(
+    pool: PgPool,
+    registry: Arc<HandlerRegistry>,
+    tx: broadcast::Sender<String>,
+) {
     let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_JOBS));
 
     let mut listener = PgListener::connect_with(&pool)
@@ -31,17 +35,17 @@ pub async fn run_worker(pool: PgPool, config: Config, tx: broadcast::Sender<Stri
             // Wait for an available slot, then process this job concurrently
             let permit = semaphore.clone().acquire_owned().await.unwrap();
             let pool2 = pool.clone();
-            let config2 = config.clone();
+            let registry2 = registry.clone();
             let tx2 = tx.clone();
 
             tokio::spawn(async move {
-                process_job(&pool2, &config2, &tx2, job).await;
+                process_job(&pool2, &registry2, &tx2, job).await;
                 drop(permit);
             });
         }
 
         // 30 secs fallback
-        let _ = tokio::time::timeout(Duration::from_secs(30), listener.recv()).await;
+        let _ = tokio::time::timeout(Duration::from_secs(2), listener.recv()).await;
     }
 }
 
@@ -80,8 +84,13 @@ async fn claim_next_job(pool: &PgPool) -> anyhow::Result<Option<Job>> {
     Ok(result)
 }
 
-async fn process_job(pool: &PgPool, config: &Config, tx: &broadcast::Sender<String>, job: Job) {
-    let handler = match executor::get_handler(&job.job_type, config) {
+async fn process_job(
+    pool: &PgPool,
+    registry: &HandlerRegistry,
+    tx: &broadcast::Sender<String>,
+    job: Job,
+) {
+    let handler = match registry.get(&job.job_type) {
         Ok(h) => h,
         Err(e) => {
             let current_attempt = job.attempts + 1;

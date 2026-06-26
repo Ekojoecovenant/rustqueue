@@ -1,6 +1,8 @@
 pub mod email;
 
-use anyhow::{Result, bail};
+use std::{collections::HashMap, sync::Arc};
+
+use anyhow::Result;
 use axum::async_trait;
 use serde_json::Value;
 
@@ -12,15 +14,30 @@ pub trait JobHandler: Send + Sync {
     async fn execute(&self, payload: &Value) -> Result<()>;
 }
 
-pub fn get_handler(job_type: &str, config: &Config) -> Result<Box<dyn JobHandler>> {
-    match job_type {
-        "email" => Ok(Box::new(EmailHandler {
-            smtp_username: config.smtp_username.clone(),
-            smtp_password: config.smtp_password.clone(),
-            smtp_host: config.smtp_host.clone(),
-            smtp_port: config.smtp_port,
-            from_email: config.from_email.clone(),
-        })),
-        other => bail!("unknown job type: {}", other),
+pub struct HandlerRegistry {
+    handlers: HashMap<String, Arc<dyn JobHandler>>,
+}
+
+impl HandlerRegistry {
+    pub fn new(config: &Config) -> Result<Self> {
+        let mut handlers: HashMap<String, Arc<dyn JobHandler>> = HashMap::new();
+
+        let email_handler = EmailHandler::new(
+            config.smtp_username.clone(),
+            config.smtp_password.clone(),
+            config.smtp_host.clone(),
+            config.smtp_port,
+            config.from_email.clone(),
+        )?;
+        handlers.insert("email".to_string(), Arc::new(email_handler));
+
+        Ok(Self { handlers })
+    }
+
+    pub fn get(&self, job_type: &str) -> Result<Arc<dyn JobHandler>> {
+        self.handlers
+            .get(job_type)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("unknown job type: {}", job_type))
     }
 }
