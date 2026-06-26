@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use sqlx::PgPool;
+use sqlx::{PgPool, postgres::PgListener};
 use tokio::{
     sync::{Semaphore, broadcast},
     time::sleep,
@@ -15,30 +15,33 @@ const MAX_CONCURRENT_JOBS: usize = 10;
 pub async fn run_worker(pool: PgPool, config: Config, tx: broadcast::Sender<String>) {
     let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_JOBS));
 
+    let mut listener = PgListener::connect_with(&pool)
+        .await
+        .expect("failed to create PgListener");
+    listener
+        .listen("new_job")
+        .await
+        .expect("failed to LISTEN on new_job");
+
     loop {
-        match claim_next_job(&pool).await {
-            Ok(Some(job)) => {
-                println!("Claimed job: {} ({})", job.id, job.job_type);
-                let _ = tx.send(format!("Job {} - processing", job.id));
+        while let Ok(Some(job)) = claim_next_job(&pool).await {
+            println!("Claimed job: {} ({})", job.id, job.job_type);
+            let _ = tx.send(format!("Job {} - processing", job.id));
 
-                // Wait for an available slot, then process this job concurrently
-                let permit = semaphore.clone().acquire_owned().await.unwrap();
-                let pool = pool.clone();
-                let config = config.clone();
-                let tx = tx.clone();
+            // Wait for an available slot, then process this job concurrently
+            let permit = semaphore.clone().acquire_owned().await.unwrap();
+            let pool2 = pool.clone();
+            let config2 = config.clone();
+            let tx2 = tx.clone();
 
-                tokio::spawn(async move {
-                    process_job(&pool, &config, &tx, job).await;
-                    drop(permit);
-                });
-            }
-            Ok(None) => {}
-            Err(e) => {
-                eprintln!("Error claiming job: {:?}", e);
-            }
+            tokio::spawn(async move {
+                process_job(&pool2, &config2, &tx2, job).await;
+                drop(permit);
+            });
         }
 
-        sleep(Duration::from_secs(2)).await;
+        // 30 secs fallback
+        let _ = tokio::time::timeout(Duration::from_secs(30), listener.recv()).await;
     }
 }
 

@@ -3,21 +3,18 @@
 ### Get all
 GET {{base}}
 
-### Create a new job
+### Create a new job (success)
 POST {{base}}
 Content-Type: application/json
 
 {
   "job_type": "email",
   "payload": {
-    "to": "test2@gmail.com"
+    "to": "covenantekojoe@gmail.com"
   }
 }
 
-### Get a particular job
-GET {{base}}/29d8ec6a-b66d-413b-828e-f042355757e1
-
-### Create a new job
+### Create a new job (failed)
 POST {{base}}
 Content-Type: application/json
 
